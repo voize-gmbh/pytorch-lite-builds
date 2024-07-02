@@ -21,7 +21,9 @@ Pod::Spec.new do |s|
 
     s.user_target_xcconfig = {
         'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-        'CLANG_CXX_LIBRARY' => 'libc++'
+        'CLANG_CXX_LIBRARY' => 'libc++',
+        'OTHER_LDFLAGS[sdk=iphoneos*]' => '$(inherited) -force_load "$(PODS_ROOT)/VoizeLibTorch-Lite/LibTorchLite.xcframework/ios-arm64/libtorch_lite.a"',
+        'OTHER_LDFLAGS[sdk=iphonesimulator*]' => '$(inherited) -force_load "$(PODS_ROOT)/VoizeLibTorch-Lite/LibTorchLite.xcframework/ios-arm64_x86_64-simulator/libtorch_lite.a"'
     }
 
     s.library = ['c++', 'stdc++']
