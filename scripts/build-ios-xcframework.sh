@@ -4,6 +4,9 @@ set -x
 
 PYTORCH_VERSION=2.1.0
 
+REPO_ROOT="$( cd "$(dirname "$0")"/.. ; pwd -P)"
+PATCHES_DIR="${REPO_ROOT}/patches"
+
 mkdir -p build/ios
 cd build/ios
 
@@ -14,6 +17,19 @@ else
 fi
 
 cd pytorch
+
+# Apply our patches on top of the upstream tag. Each is applied only if it is
+# not already present, so re-running the script is safe.
+for patch in "${PATCHES_DIR}"/*.patch; do
+  [ -e "$patch" ] || continue
+  if git apply --reverse --check "$patch" 2>/dev/null; then
+    echo "Patch already applied, skipping: $(basename "$patch")"
+  else
+    echo "Applying patch: $(basename "$patch")"
+    git apply --verbose "$patch"
+  fi
+done
+
 # remove previous build if it exists
 rm -rf build_ios
 

@@ -1,0 +1,392 @@
+diff --git a/caffe2/serialize/file_adapter.cc b/caffe2/serialize/file_adapter.cc
+index 1fddce9..dc4f447 100644
+--- a/caffe2/serialize/file_adapter.cc
++++ b/caffe2/serialize/file_adapter.cc
+@@ -2,9 +2,17 @@
+ #include <c10/util/Exception.h>
+ #include <cerrno>
+ #include <cstdio>
++#include <cstring>
+ #include <string>
+ #include "caffe2/core/common.h"
+ 
++#if !defined(_WIN32)
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
+ namespace caffe2 {
+ namespace serialize {
+ 
+@@ -78,5 +86,81 @@ size_t FileAdapter::read(uint64_t pos, void* buf, size_t n, const char* what)
+ 
+ FileAdapter::~FileAdapter() = default;
+ 
++#if !defined(_WIN32)
++MmapReadAdapter::MmapReadAdapter(const std::string& file_name) {
++  int fd = open(file_name.c_str(), O_RDONLY | O_CLOEXEC);
++  if (fd < 0) {
++    char buf[1024];
++    buf[0] = '\0';
++    strerror_r(errno, buf, sizeof(buf));
++    AT_ERROR(
++        "open file failed because of errno ",
++        errno,
++        " on open: ",
++        buf,
++        ", file path: ",
++        file_name);
++  }
++
++  struct stat st {};
++  if (fstat(fd, &st) != 0) {
++    int stat_errno = errno;
++    close(fd);
++    AT_ERROR(
++        "fstat failed because of errno ",
++        stat_errno,
++        ", file path: ",
++        file_name);
++  }
++  const auto size = static_cast<size_t>(st.st_size);
++  TORCH_CHECK(size > 0, "cannot mmap empty file, file path: ", file_name);
++
++  // PROT_READ only: the weights are never written through this mapping, so
++  // pages stay clean and the kernel can evict them under pressure instead of
++  // counting them as dirty app memory. An accidental in-place write to a
++  // weight then faults loudly rather than silently copying the page and
++  // giving the memory back.
++  void* addr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
++  // The mapping stays valid after the descriptor is closed.
++  close(fd);
++  if (addr == MAP_FAILED) {
++    AT_ERROR(
++        "mmap failed because of errno ",
++        errno,
++        ", file path: ",
++        file_name,
++        ", size: ",
++        size);
++  }
++
++  region_ = std::make_shared<MmapRegion>(addr, size);
++}
++
++size_t MmapReadAdapter::size() const {
++  return region_->size();
++}
++
++size_t MmapReadAdapter::read(
++    uint64_t pos,
++    void* buf,
++    size_t n,
++    const char* what) const {
++  (void)what;
++  const size_t size = region_->size();
++  // Match FileAdapter: clamp reads that run past the end of the file rather
++  // than failing, and report how much was actually available.
++  pos = std::min(pos, static_cast<uint64_t>(size));
++  n = std::min(size - static_cast<size_t>(pos), n);
++  std::memcpy(buf, static_cast<const char*>(region_->addr()) + pos, n);
++  return n;
++}
++
++std::shared_ptr<MmapRegion> MmapReadAdapter::mmapRegion() const {
++  return region_;
++}
++
++MmapReadAdapter::~MmapReadAdapter() = default;
++#endif // !_WIN32
++
+ } // namespace serialize
+ } // namespace caffe2
+diff --git a/caffe2/serialize/file_adapter.h b/caffe2/serialize/file_adapter.h
+index 36bc5de..c40a1b8 100644
+--- a/caffe2/serialize/file_adapter.h
++++ b/caffe2/serialize/file_adapter.h
+@@ -32,5 +32,25 @@ class TORCH_API FileAdapter final : public ReadAdapterInterface {
+   uint64_t size_;
+ };
+ 
++#if !defined(_WIN32)
++// Reads an archive through a read-only memory mapping of the file. Reads are
++// served as plain memcpy out of the mapping, and because the mapping is
++// exposed via mmapRegion() the loader can additionally point uncompressed
++// tensor storages straight at it, avoiding a heap copy of the weights.
++class TORCH_API MmapReadAdapter final : public ReadAdapterInterface {
++ public:
++  C10_DISABLE_COPY_AND_ASSIGN(MmapReadAdapter);
++  explicit MmapReadAdapter(const std::string& file_name);
++  size_t size() const override;
++  size_t read(uint64_t pos, void* buf, size_t n, const char* what = "")
++      const override;
++  std::shared_ptr<MmapRegion> mmapRegion() const override;
++  ~MmapReadAdapter() override;
++
++ private:
++  std::shared_ptr<MmapRegion> region_;
++};
++#endif // !_WIN32
++
+ } // namespace serialize
+ } // namespace caffe2
+diff --git a/caffe2/serialize/inline_container.cc b/caffe2/serialize/inline_container.cc
+index 1cff38d..efd550f 100644
+--- a/caffe2/serialize/inline_container.cc
++++ b/caffe2/serialize/inline_container.cc
+@@ -407,6 +407,55 @@ size_t PyTorchStreamReader::getRecordOffset(const std::string& name) {
+   return stat.m_local_header_ofs + MZ_ZIP_LOCAL_DIR_HEADER_SIZE + filename_len + extra_len;
+ }
+ 
++std::shared_ptr<MmapRegion> PyTorchStreamReader::mmapRegion() const {
++  return in_ ? in_->mmapRegion() : nullptr;
++}
++
++bool PyTorchStreamReader::getStoredRecordExtent(
++    const std::string& name,
++    size_t min_alignment,
++    size_t* offset,
++    size_t* size) {
++  std::lock_guard<std::mutex> guard(reader_lock_);
++  mz_zip_archive_file_stat stat;
++  mz_zip_reader_file_stat(ar_.get(), getRecordID(name), &stat);
++  valid("retrieving file meta-data for ", name.c_str());
++
++  // PyTorchStreamWriter always stores records uncompressed, but the reader
++  // also accepts archives repacked by ordinary zip tools, which may deflate
++  // some entries. Those cannot be used in place.
++  if (stat.m_method != 0) {
++    return false;
++  }
++
++  // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
++  uint8_t local_header[MZ_ZIP_LOCAL_DIR_HEADER_SIZE];
++  in_->read(
++      stat.m_local_header_ofs,
++      local_header,
++      MZ_ZIP_LOCAL_DIR_HEADER_SIZE,
++      "reading file header");
++  size_t filename_len = read_le_16(local_header + MZ_ZIP_LDH_FILENAME_LEN_OFS);
++  size_t extra_len = read_le_16(local_header + MZ_ZIP_LDH_EXTRA_LEN_OFS);
++  const size_t data_offset = stat.m_local_header_ofs +
++      MZ_ZIP_LOCAL_DIR_HEADER_SIZE + filename_len + extra_len;
++
++  // Tensor data is expected to be aligned by the writer; refuse to hand out an
++  // under-aligned pointer since kernels may assume alignment.
++  if (min_alignment != 0 && (data_offset & (min_alignment - 1)) != 0) {
++    return false;
++  }
++
++  const size_t record_size = static_cast<size_t>(stat.m_uncomp_size);
++  if (data_offset + record_size > in_->size()) {
++    return false;
++  }
++
++  *offset = data_offset;
++  *size = record_size;
++  return true;
++}
++
+ 
+ PyTorchStreamReader::~PyTorchStreamReader() {
+   mz_zip_clear_last_error(ar_.get());
+diff --git a/caffe2/serialize/inline_container.h b/caffe2/serialize/inline_container.h
+index e0d1c74..7950c2f 100644
+--- a/caffe2/serialize/inline_container.h
++++ b/caffe2/serialize/inline_container.h
+@@ -116,6 +116,21 @@ class TORCH_API PyTorchStreamReader final {
+   bool hasRecord(const std::string& name);
+   std::vector<std::string> getAllRecords();
+ 
++  // The memory mapping backing this archive, or nullptr when the underlying
++  // adapter is not mmap-backed.
++  std::shared_ptr<MmapRegion> mmapRegion() const;
++
++  // Describes where a record's bytes live in the file, but only for records
++  // stored uncompressed and aligned well enough to be used in place. On
++  // success writes the file offset and length and returns true; returns false
++  // for deflated or misaligned records, which have to go through getRecord()
++  // instead. `min_alignment` must be a power of two.
++  bool getStoredRecordExtent(
++      const std::string& name,
++      size_t min_alignment,
++      size_t* offset,
++      size_t* size);
++
+   ~PyTorchStreamReader();
+   uint64_t version() const {
+     return version_;
+diff --git a/caffe2/serialize/read_adapter_interface.cc b/caffe2/serialize/read_adapter_interface.cc
+index e9b8466..41bf135 100644
+--- a/caffe2/serialize/read_adapter_interface.cc
++++ b/caffe2/serialize/read_adapter_interface.cc
+@@ -1,8 +1,20 @@
+ #include "caffe2/serialize/read_adapter_interface.h"
+ 
++#if !defined(_WIN32)
++#include <sys/mman.h>
++#endif
++
+ namespace caffe2 {
+ namespace serialize {
+ 
++MmapRegion::~MmapRegion() {
++#if !defined(_WIN32)
++  if (addr_ != nullptr) {
++    munmap(addr_, size_);
++  }
++#endif
++}
++
+ // NOLINTNEXTLINE(modernize-use-equals-default)
+ ReadAdapterInterface::~ReadAdapterInterface() {}
+ 
+diff --git a/caffe2/serialize/read_adapter_interface.h b/caffe2/serialize/read_adapter_interface.h
+index 0a6b5b7..8eb6086 100644
+--- a/caffe2/serialize/read_adapter_interface.h
++++ b/caffe2/serialize/read_adapter_interface.h
+@@ -2,12 +2,37 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
+ 
+ #include "c10/macros/Macros.h"
+ 
+ namespace caffe2 {
+ namespace serialize {
+ 
++// A read-only memory mapping of a whole archive file. Tensor storages may
++// alias the mapping instead of owning a copy of the record bytes, so the
++// mapping has to outlive every storage that points into it. Ownership is
++// therefore shared: each aliasing storage holds a strong reference and the
++// region is unmapped once the last one goes away.
++class TORCH_API MmapRegion final {
++ public:
++  MmapRegion(void* addr, size_t size) : addr_(addr), size_(size) {}
++  ~MmapRegion();
++  MmapRegion(const MmapRegion&) = delete;
++  MmapRegion& operator=(const MmapRegion&) = delete;
++
++  void* addr() const {
++    return addr_;
++  }
++  size_t size() const {
++    return size_;
++  }
++
++ private:
++  void* addr_;
++  size_t size_;
++};
++
+ // this is the interface for the (file/stream/memory) reader in
+ // PyTorchStreamReader. with this interface, we can extend the support
+ // besides standard istream
+@@ -16,6 +41,13 @@ class TORCH_API ReadAdapterInterface {
+   virtual size_t size() const = 0;
+   virtual size_t read(uint64_t pos, void* buf, size_t n, const char* what = "")
+       const = 0;
++  // Non-null only when the whole archive is backed by a memory mapping, which
++  // lets callers hand out tensor storages that alias the file instead of
++  // copying record bytes onto the heap. Adapters that cannot offer this (the
++  // default) return nullptr and callers fall back to copying.
++  virtual std::shared_ptr<MmapRegion> mmapRegion() const {
++    return nullptr;
++  }
+   virtual ~ReadAdapterInterface();
+ };
+ 
+diff --git a/torch/csrc/jit/mobile/import.cpp b/torch/csrc/jit/mobile/import.cpp
+index 4b5f856..7e85393 100644
+--- a/torch/csrc/jit/mobile/import.cpp
++++ b/torch/csrc/jit/mobile/import.cpp
+@@ -87,6 +87,9 @@
+ namespace torch {
+ namespace jit {
+ using caffe2::serialize::MemoryReadAdapter;
++#if !defined(_WIN32)
++using caffe2::serialize::MmapReadAdapter;
++#endif
+ using caffe2::serialize::PyTorchStreamReader;
+ using caffe2::serialize::ReadAdapterInterface;
+ 
+@@ -662,7 +665,15 @@ mobile::Module _load_for_mobile(
+         data, size, device, extra_files, module_load_options);
+   }
+ 
+-  std::unique_ptr<FileAdapter> rai = std::make_unique<FileAdapter>(filename);
++  std::unique_ptr<ReadAdapterInterface> rai;
++#if !defined(_WIN32)
++  if (module_load_options & MobileModuleLoadOptions::USE_MMAP) {
++    rai = std::make_unique<MmapReadAdapter>(filename);
++  }
++#endif
++  if (!rai) {
++    rai = std::make_unique<FileAdapter>(filename);
++  }
+   return _load_for_mobile_impl(
+       std::move(rai), device, extra_files, module_load_options);
+ }
+diff --git a/torch/csrc/jit/mobile/parse_operators.h b/torch/csrc/jit/mobile/parse_operators.h
+index e796969..b4c548d 100644
+--- a/torch/csrc/jit/mobile/parse_operators.h
++++ b/torch/csrc/jit/mobile/parse_operators.h
+@@ -11,6 +11,12 @@ enum MobileModuleLoadOptions {
+   // files automatically without explicit entries mapping. Refer to PR for a
+   // detail: https://github.com/pytorch/pytorch/pull/99747
+   PARSE_ALL_EXTRA_FILE_MAPS = 2,
++  // USE_MMAP memory-maps the model file and lets tensor storages alias the
++  // mapping instead of copying the weights onto the heap. Only affects loading
++  // from a file path, and only records that are stored uncompressed and
++  // aligned; anything else still gets copied. Weight pages then stay clean and
++  // file-backed, so the OS can evict them under memory pressure.
++  USE_MMAP = 4,
+ };
+ 
+ const uint64_t kDefaultMobileLoadOptions =
+diff --git a/torch/csrc/jit/serialization/import_read.cpp b/torch/csrc/jit/serialization/import_read.cpp
+index 533fed4..b022a18 100644
+--- a/torch/csrc/jit/serialization/import_read.cpp
++++ b/torch/csrc/jit/serialization/import_read.cpp
+@@ -35,8 +35,37 @@ IValue readArchiveAndTensors(
+   std::string tensor_dir_path =
+       (!tensor_prefix.empty()) ? tensor_prefix : archive_name + "/";
+ 
+-  auto read_record = [&](const std::string& name) {
++  // When the archive is memory-mapped, tensor storages can point straight into
++  // the mapping instead of getting a heap copy of the weights. The archive
++  // format makes this safe: PyTorchStreamWriter stores records uncompressed
++  // and 64-byte aligned precisely so that the file can be mmapped and tensor
++  // data addressed in place. Records that do not qualify (deflated by a
++  // third-party zip tool, or under-aligned) still go through getRecord().
++  auto mmap_region = stream_reader.mmapRegion();
++  auto read_record = [&stream_reader, &tensor_dir_path, mmap_region](
++                         const std::string& name) -> at::DataPtr {
+     std::string ss = tensor_dir_path + name;
++    if (mmap_region) {
++      size_t offset = 0;
++      size_t size = 0;
++      if (stream_reader.getStoredRecordExtent(
++              ss, caffe2::serialize::detail::kFieldAlignment, &offset, &size)) {
++        void* addr = static_cast<char*>(mmap_region->addr()) + offset;
++        // The storage does not own these bytes, so instead of a deleter we
++        // stash a strong reference to the mapping in the DataPtr context. The
++        // region is unmapped once the last storage aliasing it is gone.
++        auto* ctx =
++            new std::shared_ptr<caffe2::serialize::MmapRegion>(mmap_region);
++        return at::DataPtr(
++            addr,
++            ctx,
++            [](void* ctx) {
++              delete static_cast<std::shared_ptr<caffe2::serialize::MmapRegion>*>(
++                  ctx);
++            },
++            at::kCPU);
++      }
++    }
+     return std::get<0>(stream_reader.getRecord(ss));
+   };
+ 
